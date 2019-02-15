@@ -1,0 +1,209 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Oliver Baumfeld"
+subtitle: Week 4 Project
+output:
+  html_notebook: default
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+# Introduction
+
+This project uses data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes. **The goal of the project is to predict the manner in which they did the exercise.**
+
+For more information on the data visit: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har 
+
+# Executive summary
+
+The data has been reduced from 153 columns to 53 columns by dropping the columns with NAs. 6 models (Linear Discriminant Analysis, SVM Linear, SVM Radial, SVM Polynomial, Random Forest & Gradient Boosting Machine) have been tuned and tested using cross-validation on the preprocessed training data. A random forest model with 7 variables randomly sampled as candidates at each split (mtry = 7) has the highest accuracy. The out-of-sample accuracy evaluated on a separate test set is estimated to be 99.44 %.
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(caret)
+library(data.table)
+library(doMC)
+registerDoMC(cores=4)
+
+# global options
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE
+)
+```
+
+# Load the data
+```{r load data, results="hide"}
+training <- read_csv("pml-training.csv")
+training <- as.data.table(training)
+head(training)
+```
+The data set has 160 rows and `r NROW(training)` columns. 
+
+## Clean data
+
+Drop all variables that are not sensor measurements. 
+```{r drop col}
+training <- select(training, -X1:-num_window)
+```
+
+# Split Data
+The data is split into a training and a test set. The training set is used for model building and model selection. No separate validation set is created as cross-validation will be used for model selection and hyperparameter tuning. The test set is used for the final evaluation of the final model to estimate the generalization (out-of-sample) error. 
+```{r split data}
+set.seed(123)
+index.train <- createDataPartition(training$classe, p=0.6)[[1]]
+df.train <- training[index.train,]
+df.test <- training[-index.train,]
+```
+The original data set contains `r NROW(training)` observations. After splitting the data the training and test set contain `r NROW(df.train)` and `r NROW(df.test)` observations, respectively.
+
+# Exploratory Data Analysis
+
+## Class distribution
+```{r plot distr}
+df.train %>% ggplot() + 
+    geom_bar(aes(classe, fill=classe)) + 
+    ggtitle("Class distribution in the training data set")
+```
+
+The classe variable has 5 unique values (A to E). There is no severe class imbalance.
+
+## Missing values
+
+The data set has only `r NROW(drop_na(training))` rows without any missing values. A strategy for handling the values has to be created. 
+```{r na}
+# df.train %>% select(colnames(df.train)[colSums(is.na(df.train)) > 0])
+df.train %>% 
+    #select_if(function(x) any(is.na(x))) %>% 
+    summarise_all(funs(sum(is.na(.)))) %>%
+    gather(key="column.name", value="number.of.na") %>%
+    count(number.of.na) %>%
+    mutate(precentage.of.na = round(number.of.na/NROW(df.train)*100, 2))
+```
+Out of all 153 columns, 100 columns do contain missing values. The columns with missing values are almost exclusively filled with missing values (sparse). Hence all columns with missing values are dropped. The classe variable contains no NAs.
+
+```{r exclude na}
+# exclude columns with NA values
+df.train.na <- df.train %>%
+    select_if(function(x) !any(is.na(x))) 
+```
+
+## Zero variance variables
+```{r zero var}
+nearZeroVar(df.train.na)
+```
+There are no near zero variance variables.
+
+## Prinicpal component analysis
+
+The training data set has `r NROW(df.train.na)` rows and `r NCOL(df.train.na)` columns. First tests have shown that the training time can get quite large. To reduce the training time the number of columns is reduced with prinicipal component analysis.
+
+```{r pca1}
+preProcValues <- preProcess(df.train.na, 
+                            method = c("center", "scale", "pca"), 
+                            thresh = 0.90)
+preProcValues
+```
+
+```{r pca2}
+df.train.na.pca <- predict(preProcValues, df.train.na)
+```
+
+# Model training
+
+We have learned from the lectures, that bagging, boosting, random forest or combinations thereof are among the most successful algorithms at kaggle competitions. Hence we will try and compare these advanced models in the project.
+
+Olson et al. [1] compare 13 models on 164 datasets for classification. They recommend gradient boosting, random forest, support vector classifier, extra trees classifier and logistic regression as a starting point for model selection.  
+
+In this study lda, random forest, SVM (polynomial kernel & radial kernel) and gradient boosted trees are used and compared. Cross-validation is used to tune the models and to chose the best model.
+
+```{r model training}
+trControl <- trainControl(method="repeatedcv", number=5, repeats=1,
+                          allowParallel = TRUE,
+                          verboseIter = TRUE)
+
+data <- df.train.na.pca
+
+set.seed(18)
+model.lda <- train(classe~., data=data, method="lda", trControl=trControl)
+set.seed(18)
+model.svmL <- train(classe~., data=data, method="svmLinear", trControl=trControl)
+set.seed(18)
+model.svmR <- train(classe~., data=data, method="svmRadial", trControl=trControl)
+set.seed(18)
+model.svmP <- train(classe~., data=data, method="svmPoly", trControl=trControl)
+set.seed(18)
+model.prf <- train(classe~., data=data, method="parRF", trControl=trControl)
+set.seed(18)
+model.gbm <- train(classe~., data=data, method="gbm", trControl=trControl, verbose = FALSE)
+```
+
+# Model evaluation
+## Model selection
+```{r model comparison}
+results <- resamples(list(LDA = model.lda,
+                          SVML = model.svmL,
+                          SVMR = model.svmR,
+                          SVMP = model.svmP,
+                          PRF = model.prf,
+                          GBM = model.gbm))
+summary(results, metric = "Accuracy")
+bwplot(results, metric = "Accuracy")
+```
+
+## Train final model
+
+The random forest method has the highest cross-validated accuracy out of the 6 tested models. Since the accuracy is well above 90 % no further models are tested. The final model is trained and tuned using the non-pca-data.
+```{r train final model, results="hide", eval=FALSE}
+trControl <- trainControl(method="repeatedcv", number=5, repeats=1,
+                          allowParallel = TRUE,
+                          verboseIter = TRUE)
+set.seed(18)
+model.prf2 <- train(classe~., data=df.train.na, method="parRF", 
+                    trControl=trControl,
+                    tuneLength = 10)
+```
+
+```{r final model}
+model.prf2
+```
+
+```{r conf matrix}
+#results <- resamples(list(PRF2 = model.prf2), metrics = "Accuracy")
+confusionMatrix.train(model.prf2)
+```
+
+## Final evaluation
+
+Preprocess the test data
+```{r prepro test}
+# the same tranformations as above have to be done for the test set
+df.test.na <- df.test %>%
+    select_if(function(x) !any(is.na(x))) 
+```
+
+Calculate the confusion matrix
+```{r test CM}
+confusionMatrix(predict(model.prf2, df.test.na), as.factor(df.test.na$classe))
+```
+
+From the final evaluation on the test set we estimate an out-of-sample accuracy of 99.44 %  with a 95% confidence interval ranging from 99.25 % to 99.59%.
+
+# Quiz
+Calculate the answers for the extra test set.
+```{r quiz data, results="hide"}
+# load a preprocess quiz data
+testing <- read_csv("pml-testing.csv")
+testing <- select(testing, -X1:-num_window)
+# exclude columns with NA values
+testing <- testing %>%
+    select_if(function(x) !any(is.na(x))) 
+```
+```{r quiz predict}
+predict(model.prf2, testing)
+```
+
+**References**
+
+[1] Olson et al., arXiv 2018, *Data-driven Advice for Applying Machine Learning to Bioinformatics Problems*, https://arxiv.org/abs/1708.05070
+
